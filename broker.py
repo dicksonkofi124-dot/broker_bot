@@ -4,6 +4,9 @@ import logging
 import sys
 import math
 import httpx
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from supabase import create_client, Client
@@ -15,10 +18,8 @@ SUPABASE_URL = "https://supabase.co"
 SUPABASE_KEY = "sb_publishable_MOAgTjmJK9hOtB36yYrylA_sYxufidf"
 
 TELEGRAM_BOT_TOKEN = "8705718355:AAFNWWMrmAacQIu876J4kyopXAp_Twcnj44"
-# This acts as your backup/admin chat ID
 TELEGRAM_CHAT_ID = "1059602487"
 
-# Settings
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
 TRADE_EXPIRATION_SECONDS = 60
@@ -32,15 +33,12 @@ logger = logging.getLogger("EO_Signal_Engine")
 # BROADCAST TELEGRAM FUNCTION
 # ============================================================
 async def broadcast_telegram(message: str, db_client: Client):
-    """Fetches all registered chat IDs from Supabase and blasts the message to them."""
     if TELEGRAM_BOT_TOKEN.startswith("YOUR_"):
         logger.warning("Telegram token not configured.")
         return
 
-    # Start with your default admin ID to guarantee you get it
     target_chats = [TELEGRAM_CHAT_ID]
 
-    # Dynamically grab anyone else who hit /start from the database
     try:
         response = db_client.table("bot_users").select("chat_id").execute()
         if response.data:
@@ -175,7 +173,7 @@ class MarketDataFeed:
 
 
 # ============================================================
-# Main Bot
+# Main Bot Engine
 # ============================================================
 class EOLivePredictorBot:
     def __init__(self):
@@ -202,7 +200,6 @@ class EOLivePredictorBot:
             await asyncio.sleep(0.5)
 
     async def telegram_listener_loop(self):
-        """Polls Telegram for incoming user commands and broadcast inputs."""
         offset = 0
         url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/getUpdates"
         
@@ -223,17 +220,13 @@ class EOLivePredictorBot:
                             text = message.get("text", "")
                             chat_id = message["chat"]["id"]
                             
-                            # 1. ADMIN ANNOUNCEMENT SYSTEM
                             if text.startswith("/broadcast ") and str(chat_id) == TELEGRAM_CHAT_ID:
-                                # Strip out the command text prefix
                                 announcement = text.replace("/broadcast ", "", 1).strip()
                                 if announcement:
                                     formatted_announcement = f"📢 <b>ADMIN ANNOUNCEMENT</b>\n\n{announcement}"
                                     await broadcast_telegram(formatted_announcement, self.db_client)
-                                    logger.info("Admin broadcast executed successfully.")
                                 continue
 
-                            # 2. NEW SUBSCRIBER REGISTRATION
                             if text == "/start":
                                 first_name = message["chat"].get("first_name", "Trader")
                                 try:
@@ -247,5 +240,19 @@ class EOLivePredictorBot:
                                         "chat_id": chat_id,
                                         "text": f"👋 Hello {first_name}! Welcome to the Live Signals channel. You will now receive live Medium & High confidence alerts."
                                     })
-                                    logger.info(f"Registered new subscriber: {first_name} ({chat_id})")
                                 except Exception as dbe:
+                                    logger.error(f"Database insertion failed for user {chat_id}: {dbe}")
+            except Exception as e:
+                logger.error(f"Telegram listener error: {e}")
+            
+            await asyncio.sleep(2)
+
+    async def log_trade(self, direction, price, score):
+        try:
+            self.db_client.table("paper_trades").insert({
+                "asset_pair": "EUR/USD (OTC)",
+                "direction": direction,
+                "entry_price": round(price, 5),
+                "pytorch_output": round(score, 4),
+                "status": "PENDING"
+            }).execute()
