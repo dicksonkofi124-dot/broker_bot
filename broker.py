@@ -238,7 +238,7 @@ class EOLivePredictorBot:
                                     welcome_url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
                                     await client.post(welcome_url, json={
                                         "chat_id": chat_id,
-                                        "text": f"👋 Hello {first_name}! Welcome to the Live Signals channel. You will now receive live Medium & High confidence alerts."
+                                        "text": f"👋 Hello {first_name}! Welcome to the Live Broker Signals channel. You will now receive live Medium & High confidence alerts."
                                     })
                                 except Exception as dbe:
                                     logger.error(f"Database insertion failed for user {chat_id}: {dbe}")
