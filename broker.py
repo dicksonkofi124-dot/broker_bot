@@ -256,3 +256,5 @@ class EOLivePredictorBot:
                 "pytorch_output": round(score, 4),
                 "status": "PENDING"
             }).execute()
+        except Exception as e:
+            logger.error(f"Trade insertion failed: {e}")
