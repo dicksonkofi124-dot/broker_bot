@@ -13,10 +13,10 @@ from supabase import create_client, Client
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ivaxghyxkeamhzujdkxu.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_MOAgTjmJK9hOtB36yYrylA_sYxufidf")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8705718355:AAFNWWMrmAacQIu876J4kyopXAp_Twcnj44")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1059602487")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
@@ -197,6 +197,12 @@ class EOLivePredictorBot:
             raise RuntimeError(
                 "Missing required environment variables: "
                 + ", ".join(missing_settings)
+            )
+        if SUPABASE_KEY.startswith(("sb_publishable_", "sb_secret_")):
+            raise RuntimeError(
+                "supabase==2.7.4 requires a legacy JWT-format API key. "
+                "Set SUPABASE_KEY to the project's legacy anon key from "
+                "Supabase API settings."
             )
 
         self.db_client = create_client(SUPABASE_URL, SUPABASE_KEY)
