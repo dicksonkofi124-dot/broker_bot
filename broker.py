@@ -14,7 +14,8 @@ from supabase import create_client, Client
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SUPABASE_URL = "https://supabase.co"
+# Fixed: Restored your production Supabase cluster endpoint
+SUPABASE_URL = "https://ivaxghyxkeamhzujdkxu.supabase.co"
 SUPABASE_KEY = "sb_publishable_MOAgTjmJK9hOtB36yYrylA_sYxufidf"
 
 TELEGRAM_BOT_TOKEN = "8705718355:AAFNWWMrmAacQIu876J4kyopXAp_Twcnj44"
@@ -49,7 +50,8 @@ async def broadcast_telegram(message: str, db_client: Client):
     except Exception as e:
         logger.error(f"Error fetching subscriber list from Supabase: {e}")
 
-    url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
+    # Fixed: Restored correct official Telegram API endpoint route path
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
     async with httpx.AsyncClient() as client:
         for chat_id in target_chats:
@@ -201,7 +203,8 @@ class EOLivePredictorBot:
 
     async def telegram_listener_loop(self):
         offset = 0
-        url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/getUpdates"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
         
         while self.is_running:
             try:
@@ -235,7 +238,7 @@ class EOLivePredictorBot:
                                         "username": first_name
                                     }, on_conflict="chat_id").execute()
                                     
-                                    welcome_url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
+                                    welcome_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                                     await client.post(welcome_url, json={
                                         "chat_id": chat_id,
                                         "text": f"👋 Hello {first_name}! Welcome to the Live Broker Signals channel. You will now receive live Medium & High confidence alerts."
@@ -258,3 +261,98 @@ class EOLivePredictorBot:
             }).execute()
         except Exception as e:
             logger.error(f"Trade insertion failed: {e}")
+
+    async def execution_loop(self):
+        while self.is_running:
+            if self.trading_unlocked:
+                prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
+                if len(prices) >= SEQUENCE_LENGTH:
+                    decision, score, expiration, confidence = self.model.evaluate_sequence(prices)
+                    price = prices[-1]
+
+                    time_since_last = (datetime.now() - self.last_signal_time).total_seconds()
+
+                    if decision != 0 and confidence != "Low" and time_since_last >= 55:
+                        direction = "BUY" if decision == 1 else "SELL"
+                        await self.log_trade(direction, price, score)
+
+                        emoji = "🟢" if decision == 1 else "🔴"
+                        msg = (
+                            f"{emoji} <b>{direction} SIGNAL</b>\n\n"
+                            f"Asset: <b>EUR/USD (OTC)</b>\n"
+                            f"Entry: <code>{price:.5f}</code>\n"
+                            f"Score: <code>{score:.4f}</code>\n"
+                            f"⏱️ Time: <b>{expiration}s</b>\n"
+                            f"📊 Confidence: <b>{confidence}</b>\n\n"
+                            f"{datetime.now().strftime('%H:%M:%S')}"
+                        )
+                        await broadcast_telegram(msg, self.db_client)
+                        self.last_signal_time = datetime.now()
+
+                        delay = random.uniform(55, 95)
+                        await asyncio.sleep(delay)
+                        continue
+
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(1)
+
+    async def resolve_trades(self):
+        while self.is_running:
+            try:
+                response = self.db_client.table("paper_trades").select("*").eq("status", "PENDING").execute()
+                pending = response.data or []
+                current = self.feed.get_current_price()
+
+                if pending and current:
+                    now = datetime.now(timezone.utc)
+                    for trade in pending:
+                        executed_at = datetime.fromisoformat(trade["executed_at"].replace("Z", "+00:00"))
+                        if (now - executed_at).total_seconds() < TRADE_EXPIRATION_SECONDS:
+                            continue
+
+                        direction = trade["direction"]
+                        entry = float(trade["entry_price"])
+                        score = float(trade.get("pytorch_output", 0))
+                        was_win = (direction == "BUY" and current > entry) or (direction == "SELL" and current < entry)
+
+                        try:
+                            self.db_client.table("paper_trades").update({
+                                "status": "WIN" if was_win else "LOSS",
+                                "exit_price": round(current, 5)
+                            }).eq("id", trade["id"]).execute()
+
+                            self.model.learn_from_outcome(score, was_win)
+                        except Exception as update_err:
+                            logger.error(f"Failed inside resolution row: {update_err}")
+            except Exception as e:
+                logger.error(f"Resolve error: {e}")
+            await asyncio.sleep(RESOLUTION_POLL_INTERVAL)
+
+    async def start(self):
+        await broadcast_telegram("🤖 <b>EO Signal Bot Started</b>\nOnly Medium & High confidence signals will be sent.", self.db_client)
+        await asyncio.gather(
+            self.feed.start(),
+            self.monitor_phase(),
+            self.telegram_listener_loop(),
+            self.execution_loop(),
+            self.resolve_trades()
+        )
+
+
+# ============================================================
+# FASTAPI & LIFESPAN MANAGEMENT (CRITICAL FOR RENDER)
+# ============================================================
+bot_engine = EOLivePredictorBot()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(bot_engine.start())
+    yield
+    bot_engine.is_running = False
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def read_root():
+    return {"status": "Bot is alive and running!", "timestamp": datetime.now(timezone.utc).isoformat()}
