@@ -1,10 +1,9 @@
 import asyncio
 import random
 import logging
-import sys
+import os
 import math
 import httpx
-import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from datetime import datetime, timedelta, timezone
@@ -14,12 +13,10 @@ from supabase import create_client, Client
 # ============================================================
 # CONFIGURATION
 # ============================================================
-# Fixed: Restored your production Supabase cluster endpoint
-SUPABASE_URL = "https://ivaxghyxkeamhzujdkxu.supabase.co"
-SUPABASE_KEY = "sb_publishable_MOAgTjmJK9hOtB36yYrylA_sYxufidf"
-
-TELEGRAM_BOT_TOKEN = "8705718355:AAFNWWMrmAacQIu876J4kyopXAp_Twcnj44"
-TELEGRAM_CHAT_ID = "1059602487"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ivaxghyxkeamhzujdkxu.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_MOAgTjmJK9hOtB36yYrylA_sYxufidf")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8705718355:AAFNWWMrmAacQIu876J4kyopXAp_Twcnj44")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1059602487")
 
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
@@ -186,12 +183,24 @@ class EOLivePredictorBot:
         self.unlock_time = datetime.now() + timedelta(seconds=OBSERVATION_SECONDS)
         self.last_signal_time = datetime.now() - timedelta(seconds=60)
 
-        try:
-            self.db_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-            logger.info("Connected to Supabase")
-        except Exception as e:
-            logger.critical(f"DB Error: {e}")
-            sys.exit(1)
+        missing_settings = [
+            name
+            for name, value in (
+                ("SUPABASE_URL", SUPABASE_URL),
+                ("SUPABASE_KEY", SUPABASE_KEY),
+                ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+                ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+            )
+            if not value
+        ]
+        if missing_settings:
+            raise RuntimeError(
+                "Missing required environment variables: "
+                + ", ".join(missing_settings)
+            )
+
+        self.db_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Connected to Supabase")
 
     async def monitor_phase(self):
         while self.is_running:
@@ -209,7 +218,7 @@ class EOLivePredictorBot:
         while self.is_running:
             try:
                 async with httpx.AsyncClient() as client:
-                    response = client.get(url, params={"offset": offset, "timeout": 20}, timeout=25)
+                    response = await client.get(url, params={"offset": offset, "timeout": 20}, timeout=25)
                     data = response.json()
                     
                     if data.get("ok") and data.get("result"):
@@ -343,13 +352,15 @@ class EOLivePredictorBot:
 # ============================================================
 # FASTAPI & LIFESPAN MANAGEMENT (CRITICAL FOR RENDER)
 # ============================================================
-bot_engine = EOLivePredictorBot()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(bot_engine.start())
-    yield
-    bot_engine.is_running = False
+    bot_engine = EOLivePredictorBot()
+    bot_task = asyncio.create_task(bot_engine.start())
+    try:
+        yield
+    finally:
+        bot_engine.is_running = False
+        await bot_task
 
 app = FastAPI(lifespan=lifespan)
 
