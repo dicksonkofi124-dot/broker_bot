@@ -41,6 +41,9 @@ MEDIUM_EDGE = 0.05
 HIGH_EDGE = 0.10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# httpx logs full URLs at INFO level, which would print your Telegram bot token in the logs
+for noisy_logger in ("httpx", "httpcore", "websockets"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger("EO_Signal_Engine")
 
 
@@ -281,7 +284,7 @@ class JarvisLearningModule:
 # Data Feed
 # ============================================================
 class MarketDataFeed:
-    """Live EUR/USD prices from Finnhub's WebSocket."""
+    """Live EUR/USD prices from Finnhub's WebSocket (needs a free API key)."""
 
     def __init__(self):
         if not FINNHUB_API_KEY:
@@ -496,6 +499,7 @@ class EOLivePredictorBot:
     async def telegram_listener_loop(self):
         offset = 0
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
 
         while self.is_running:
             try:
@@ -760,7 +764,7 @@ class EOLivePredictorBot:
         self.restore_learning_history()
         await broadcast_telegram(
             "🤖 <b>Signal bot started</b>\n"
-            f"Signals use Finnhub {FINNHUB_SYMBOL} reference prices, which may differ from EO Broker OTC.\n"
+            "Signals use Finnhub EUR/USD reference prices, which may differ from EO Broker OTC.\n"
             "JARVIS keeps adapting its signal filter from recent resolved Finnhub paper trades.",
             self.db_client,
             self.subscribers,
