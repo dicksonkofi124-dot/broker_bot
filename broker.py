@@ -848,6 +848,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "Bot is alive and running!", "timestamp": datetime.now(timezone.utc).isoformat()}
