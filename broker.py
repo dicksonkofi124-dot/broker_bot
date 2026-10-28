@@ -22,6 +22,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_SYMBOL = os.getenv("FINNHUB_SYMBOL", "OANDA:EUR_USD")
 FINNHUB_WS_URL = "wss://ws.finnhub.io"
+# Safety gate: "relaxed" (default) pauses signals only after a clearly losing run,
+# "strict" pauses unless recent results are convincingly good, "off" never pauses.
+SIGNAL_GATE = os.getenv("SIGNAL_GATE", "relaxed").lower()
 
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
@@ -208,6 +211,8 @@ class JarvisLearningModule:
         self.total_trades = 0
         self.model = OnlineLogisticModel(n_features=5)
         self.last_edge = None
+        self.shadow_memory = deque(maxlen=60)  # would-be signals scored after the fact (sent or not)
+        self.last_shadow_at = None
 
     @staticmethod
     def extract_features(prices):
@@ -249,20 +254,52 @@ class JarvisLearningModule:
         direction = 1 if edge > 0 else -1
         confidence = self.confidence_band(edge)
 
-        if confidence != "Low":
-            band_outcomes = [
-                won
-                for score, won in self.outcome_memory
-                if self.confidence_band(score) == confidence
-                and (1 if score > 0 else -1) == direction
-            ]
-            if (
-                len(band_outcomes) >= 20
-                and self.wilson_lower_bound(band_outcomes) < 0.45
-            ):
-                confidence = "Low"
+        if confidence != "Low" and not self.gate_allows():
+            confidence = "Low"
 
         return direction, edge, TRADE_EXPIRATION_SECONDS, confidence
+
+    def record_shadow(self, edge, correct, when):
+        """Score every confident prediction, sent or not, about once per 30s (nearly independent).
+        This is what lets the gate reopen: blocked signals still get judged."""
+        if abs(edge) < MIN_EDGE:
+            return
+        if (
+            self.last_shadow_at is not None
+            and (when - self.last_shadow_at).total_seconds() < TRADE_EXPIRATION_SECONDS
+        ):
+            return
+        self.last_shadow_at = when
+        self.shadow_memory.append(bool(correct))
+
+    def gate_allows(self):
+        outcomes = list(self.shadow_memory)
+        if SIGNAL_GATE == "off":
+            return True
+        if SIGNAL_GATE == "strict":
+            return not (len(outcomes) >= 20 and self.wilson_lower_bound(outcomes) < 0.45)
+        return not (len(outcomes) >= 30 and self.wilson_upper_bound(outcomes) < 0.50)
+
+    def gate_status(self):
+        outcomes = list(self.shadow_memory)
+        if not outcomes:
+            return f"{SIGNAL_GATE}:open(no data)"
+        state = "open" if self.gate_allows() else "BLOCKED"
+        return f"{SIGNAL_GATE}:{state}(win={100 * sum(outcomes) / len(outcomes):.0f}% n={len(outcomes)})"
+
+    @staticmethod
+    def wilson_upper_bound(outcomes):
+        sample_size = len(outcomes)
+        if sample_size == 0:
+            return 1.0
+        win_rate = sum(outcomes) / sample_size
+        z_score = 1.96
+        denominator = 1 + z_score**2 / sample_size
+        center = win_rate + z_score**2 / (2 * sample_size)
+        margin = z_score * math.sqrt(
+            (win_rate * (1 - win_rate) + z_score**2 / (4 * sample_size)) / sample_size
+        )
+        return (center + margin) / denominator
 
     @staticmethod
     def confidence_band(score):
@@ -323,6 +360,7 @@ class HorizonTracker:
         self.ties = 0
         self.small_moves = 0
         self.seen = 0
+        self.on_result = None  # optional callback(edge, correct, time)
 
     def add_sample(self, now, features, price):
         edge = None
@@ -349,6 +387,8 @@ class HorizonTracker:
             if edge is not None:
                 correct = (edge > 0) == went_up
                 self.hits.append(correct)
+                if self.on_result:
+                    self.on_result(edge, correct, now)
                 if abs(edge) >= MEDIUM_EDGE:
                     self.strong_hits.append(correct)
 
@@ -529,6 +569,7 @@ class EOLivePredictorBot:
         self.jarvis = JarvisLearningModule()
         self.trackers = [HorizonTracker(*horizon) for horizon in HORIZONS]
         self.trackers[0].model = self.jarvis.model  # the 30s model is the one that drives signals
+        self.trackers[0].on_result = self.jarvis.record_shadow
         self.sample_buffer = []
         self.subscribers: set[str] = set()
         self.is_running = True
@@ -855,7 +896,7 @@ class EOLivePredictorBot:
                     )
                     edge = self.jarvis.last_edge
                     logger.info(
-                        "[STATUS] price_age=%ss buffer=%s/%s samples=%s/%s last_edge=%s unlocked=%s",
+                        "[STATUS] price_age=%ss buffer=%s/%s samples=%s/%s last_edge=%s unlocked=%s gate=%s",
                         price_age,
                         len(feed.price_buffer),
                         SEQUENCE_LENGTH,
@@ -863,6 +904,7 @@ class EOLivePredictorBot:
                         MIN_TRAIN_SAMPLES,
                         "none" if edge is None else f"{edge:+.3f}",
                         getattr(self, "trading_unlocked", "n/a"),
+                        self.jarvis.gate_status(),
                     )
 
                 if self.feed.has_fresh_price() and self.feed.has_full_price_window():
