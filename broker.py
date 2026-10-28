@@ -28,17 +28,40 @@ OBSERVATION_SECONDS = 12
 TRADE_EXPIRATION_SECONDS = 30
 RESOLUTION_POLL_INTERVAL = 3.0
 # Rows older than this were scored by the OLD formula, so they are ignored.
-LEARNING_HISTORY_START_AT = datetime(2026, 10, 27, 13, tzinfo=timezone.utc)
+LEARNING_HISTORY_START_AT = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
 LEARNING_HISTORY_LIMIT = 200
 
 # Learning settings
 LEARNING_SAMPLE_SECONDS = 5     # take a training sample every 5s
-MODEL_STATE_ID = "eurusd_online_v1"   # row id in the model_state table
-MODEL_SAVE_EVERY = 50            # save learned weights every 50 new samples
+MODEL_STATE_ID = "eurusd_multi_v2"   # row id in the model_state table (new model = fresh start)
+MODEL_SAVE_SECONDS = 300         # save learned weights every 5 minutes
+
+# Calmer learning: the step size starts at LR_START, shrinks as samples grow, never below LR_FLOOR
+LR_START = 0.02
+LR_FLOOR = 0.001
+LR_DECAY_SAMPLES = 300
+L2_STRENGTH = 0.05
+
+# Horizons tracked side by side (paper only): (name, expiry seconds, input window seconds, min move to TRAIN on)
+# window None = the live 20-second buffer. min move filters tiny noise out of TRAINING only;
+# accuracy is always measured on every sample.
+HORIZONS = [
+    ("30s", 30, None, 0.00002),
+    ("1m", 60, 60, 0.00003),
+    ("5m", 300, 300, 0.00005),
+    ("15m", 900, 900, 0.00008),
+    ("1h", 3600, 1800, 0.00015),
+]
+HISTORY_SECONDS = 1800           # price history kept for the longer input windows
+STORE_EVERY_N = 3                # store every 3rd finished sample (~1 per 15s per horizon)
+SAMPLE_FLUSH_SECONDS = 60        # write stored samples to Supabase once a minute
+SAMPLE_BUFFER_MAX = 3000         # if Supabase is unreachable, keep at most this many
 MIN_TRAIN_SAMPLES = 300         # model stays silent until it has learned from this many
-MIN_EDGE = 0.03                 # P(up) must be at least 3% away from 50% to signal
-MEDIUM_EDGE = 0.05
-HIGH_EDGE = 0.10
+# Edge = how far P(up) is from 50%. On pure noise the model still reaches 5% fairly often,
+# so signals need a bigger edge than that (tested: only ~6% of noise windows reach 10%).
+MIN_EDGE = 0.08
+MEDIUM_EDGE = 0.10
+HIGH_EDGE = 0.15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 # httpx logs full URLs at INFO level, which would print your Telegram bot token in the logs
@@ -125,10 +148,9 @@ class RunningStats:
 class OnlineLogisticModel:
     """Tiny logistic regression that learns one example at a time (no extra libraries)."""
 
-    def __init__(self, n_features, lr=0.02, l2=1e-3):
+    def __init__(self, n_features, l2=L2_STRENGTH):
         self.w = [0.0] * n_features
         self.b = 0.0
-        self.lr = lr
         self.l2 = l2
         self.stats = RunningStats(n_features)
         self.n_updates = 0
@@ -147,9 +169,10 @@ class OnlineLogisticModel:
         x = self.stats.standardize(features)
         p = self._sigmoid(self.b + sum(w * v for w, v in zip(self.w, x)))
         err = p - label
+        lr = max(LR_FLOOR, LR_START / (1 + self.n_updates / LR_DECAY_SAMPLES))
         for i in range(len(self.w)):
-            self.w[i] -= self.lr * (err * x[i] + self.l2 * self.w[i])
-        self.b -= self.lr * err
+            self.w[i] -= lr * (err * x[i] + self.l2 * self.w[i])
+        self.b -= lr * err
         self.n_updates += 1
 
     def to_dict(self):
@@ -285,6 +308,85 @@ class JarvisLearningModule:
 # ============================================================
 # Data Feed
 # ============================================================
+class HorizonTracker:
+    """Paper-only learner for ONE expiry time: predicts, waits, checks, learns."""
+
+    def __init__(self, name, seconds, window_seconds, min_move):
+        self.name = name
+        self.seconds = seconds
+        self.window_seconds = window_seconds
+        self.min_move = min_move
+        self.model = OnlineLogisticModel(n_features=5)
+        self.pending = deque()
+        self.hits = deque(maxlen=500)         # honest: guess made BEFORE the outcome was known
+        self.strong_hits = deque(maxlen=500)  # only guesses with |edge| >= MEDIUM_EDGE
+        self.ties = 0
+        self.small_moves = 0
+        self.seen = 0
+
+    def add_sample(self, now, features, price):
+        edge = None
+        if self.model.n_updates >= 30:
+            edge = self.model.predict_proba(features) - 0.5
+        self.pending.append((now, features, price, edge))
+
+    def resolve(self, now, price):
+        """Label samples whose time is up. Returns finished samples (for storing)."""
+        finished = []
+        while self.pending:
+            sampled_at, features, entry, edge = self.pending[0]
+            age = (now - sampled_at).total_seconds()
+            if age < self.seconds:
+                break
+            self.pending.popleft()
+            if age > self.seconds + 10:
+                continue  # too late to trust the exit price
+            if round(price, 5) == round(entry, 5):
+                self.ties += 1  # a tie is refunded by brokers, so it is neither win nor loss
+                continue
+
+            went_up = price > entry
+            if edge is not None:
+                correct = (edge > 0) == went_up
+                self.hits.append(correct)
+                if abs(edge) >= MEDIUM_EDGE:
+                    self.strong_hits.append(correct)
+
+            if abs(price - entry) < self.min_move:
+                self.small_moves += 1  # too small to learn from, but still scored above
+            else:
+                self.model.update(features, 1 if went_up else 0)
+
+            self.seen += 1
+            if self.seen % STORE_EVERY_N == 0:
+                finished.append(
+                    {
+                        "created_at": sampled_at.isoformat(),
+                        "horizon_seconds": self.seconds,
+                        "features": [round(f, 6) for f in features],
+                        "entry_price": entry,
+                        "exit_price": round(price, 5),
+                        "label": 1 if went_up else 0,
+                        "predicted_edge": None if edge is None else round(edge, 4),
+                    }
+                )
+        return finished
+
+    def summary(self):
+        def pct(values):
+            if not values:
+                return "n/a"
+            # samples overlap (one every 5s, each judged over the full horizon), so the number of
+            # truly independent trades is much smaller than the sample count
+            independent = max(1, round(len(values) * LEARNING_SAMPLE_SECONDS / self.seconds))
+            return f"{100 * sum(values) / len(values):.1f}%(n={len(values)}, ~{independent} indep)"
+
+        return (
+            f"{self.name}: learned={self.model.n_updates} acc={pct(self.hits)} "
+            f"strong={pct(self.strong_hits)} ties={self.ties}"
+        )
+
+
 class MarketDataFeed:
     """Live EUR/USD prices from Finnhub's WebSocket (needs a free API key)."""
 
@@ -295,6 +397,7 @@ class MarketDataFeed:
         if not FINNHUB_API_KEY:
             raise RuntimeError("Missing required environment variable: FINNHUB_API_KEY")
         self.price_buffer = deque(maxlen=SEQUENCE_LENGTH)
+        self.history = deque(maxlen=HISTORY_SECONDS + 60)  # (unix time, price) once per second
         self.latest_price = None
         self.last_update_at = None
         self._first_tick_logged = False
@@ -305,6 +408,7 @@ class MarketDataFeed:
             await asyncio.sleep(1)
             if self.latest_price is not None and self.has_fresh_price():
                 self.price_buffer.append(self.latest_price)
+                self.history.append((datetime.now(timezone.utc).timestamp(), self.latest_price))
 
     def _handle_message(self, raw):
         try:
@@ -392,6 +496,17 @@ class MarketDataFeed:
     def get_latest_prices(self, n):
         return list(self.price_buffer)[-n:]
 
+    def get_window(self, seconds, points=SEQUENCE_LENGTH):
+        """`points` evenly spaced prices covering the last `seconds`, or None if history is too thin."""
+        if not self.history:
+            return None
+        newest_ts = self.history[-1][0]
+        recent = [(ts, p) for ts, p in self.history if newest_ts - ts <= seconds]
+        if len(recent) < 0.8 * seconds or newest_ts - recent[0][0] < 0.9 * seconds:
+            return None
+        last = len(recent) - 1
+        return [recent[round(i * last / (points - 1))][1] for i in range(points)]
+
     def get_current_price(self):
         return self.price_buffer[-1] if self.price_buffer else None
 
@@ -412,6 +527,9 @@ class EOLivePredictorBot:
     def __init__(self):
         self.feed = MarketDataFeed()
         self.jarvis = JarvisLearningModule()
+        self.trackers = [HorizonTracker(*horizon) for horizon in HORIZONS]
+        self.trackers[0].model = self.jarvis.model  # the 30s model is the one that drives signals
+        self.sample_buffer = []
         self.subscribers: set[str] = set()
         self.is_running = True
         self.trading_unlocked = False
@@ -455,25 +573,48 @@ class EOLivePredictorBot:
             if not response.data:
                 logger.info("No saved model found; starting fresh")
                 return
-            self.jarvis.model.load_dict(response.data[0]["state"])
-            logger.info(
-                "Restored learned model (%s samples)", self.jarvis.model.n_updates
-            )
+            saved = response.data[0]["state"].get("horizons", {})
+            restored = []
+            for tracker in self.trackers:
+                if tracker.name in saved:
+                    try:
+                        tracker.model.load_dict(saved[tracker.name])
+                        restored.append(f"{tracker.name}={tracker.model.n_updates}")
+                    except Exception as e:
+                        logger.error("Could not restore %s model: %s", tracker.name, e)
+            logger.info("Restored learned models: %s", ", ".join(restored) or "none")
         except Exception as e:
             logger.error("Could not restore saved model, starting fresh: %s", e)
 
-    def save_model_state(self):
+    def model_state_snapshot(self):
+        return {"version": 2, "horizons": {t.name: t.model.to_dict() for t in self.trackers}}
+
+    def save_model_state(self, state=None):
         try:
             self.db_client.table("model_state").upsert(
                 {
                     "id": MODEL_STATE_ID,
-                    "state": self.jarvis.model.to_dict(),
+                    "state": state or self.model_state_snapshot(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
                 on_conflict="id",
             ).execute()
         except Exception as e:
             logger.error("Could not save model state: %s", e)
+
+    async def flush_samples(self):
+        batch = self.sample_buffer[:500]
+        if not batch:
+            return
+        try:
+            await asyncio.to_thread(
+                lambda: self.db_client.table("learning_samples").insert(batch).execute()
+            )
+            del self.sample_buffer[: len(batch)]
+        except Exception as e:
+            logger.error("Could not store samples (is the learning_samples table created?): %s", e)
+            if len(self.sample_buffer) > SAMPLE_BUFFER_MAX:
+                del self.sample_buffer[: len(self.sample_buffer) - SAMPLE_BUFFER_MAX]
 
     def restore_learning_history(self):
         try:
@@ -693,19 +834,22 @@ class EOLivePredictorBot:
                 await asyncio.sleep(1)
 
     async def learning_loop(self):
-        """Learns from EVERY price window (not just trades): predict, wait 30s, check, learn."""
-        pending = deque()
-        recent_hits = deque(maxlen=500)
+        """Learns on every horizon from every window (paper only), stores samples, logs honest stats."""
+        started = datetime.now(timezone.utc)
         last_sample_at = None
         last_status_at = None
+        last_summary_at = started
+        last_save_at = started
+        last_flush_at = started
         while self.is_running:
             try:
-                status_now = datetime.now(timezone.utc)
-                if last_status_at is None or (status_now - last_status_at).total_seconds() >= 120:
-                    last_status_at = status_now
+                now = datetime.now(timezone.utc)
+
+                if last_status_at is None or (now - last_status_at).total_seconds() >= 120:
+                    last_status_at = now
                     feed = self.feed
                     price_age = (
-                        round((status_now - feed.last_update_at).total_seconds())
+                        round((now - feed.last_update_at).total_seconds())
                         if feed.last_update_at
                         else None
                     )
@@ -722,52 +866,39 @@ class EOLivePredictorBot:
                     )
 
                 if self.feed.has_fresh_price() and self.feed.has_full_price_window():
-                    now = datetime.now(timezone.utc)
                     price = self.feed.get_current_price()
 
                     if (
                         last_sample_at is None
                         or (now - last_sample_at).total_seconds() >= LEARNING_SAMPLE_SECONDS
                     ):
-                        features = self.jarvis.extract_features(
-                            self.feed.get_latest_prices(SEQUENCE_LENGTH)
-                        )
-                        if features is not None:
-                            model = self.jarvis.model
-                            # remember the guess made NOW, so accuracy is measured honestly
-                            guess_up = (
-                                model.predict_proba(features) >= 0.5
-                                if model.n_updates >= 30
-                                else None
-                            )
-                            pending.append((now, features, price, guess_up))
                         last_sample_at = now
+                        for tracker in self.trackers:
+                            if tracker.window_seconds is None:
+                                window = self.feed.get_latest_prices(SEQUENCE_LENGTH)
+                            else:
+                                window = self.feed.get_window(tracker.window_seconds)
+                            if not window:
+                                continue
+                            features = self.jarvis.extract_features(window)
+                            if features is not None:
+                                tracker.add_sample(now, features, price)
 
-                    while pending:
-                        sampled_at, features, entry, guess_up = pending[0]
-                        age = (now - sampled_at).total_seconds()
-                        if age < TRADE_EXPIRATION_SECONDS:
-                            break
-                        pending.popleft()
-                        if age > TRADE_EXPIRATION_SECONDS + 5 or price == entry:
-                            continue  # stale sample or no move: skip
+                    for tracker in self.trackers:
+                        self.sample_buffer.extend(tracker.resolve(now, price))
 
-                        label = 1 if price > entry else 0
-                        model = self.jarvis.model
-                        if guess_up is not None:
-                            recent_hits.append(guess_up == (label == 1))
-                        model.update(features, label)
+                if (now - last_summary_at).total_seconds() >= 300:
+                    last_summary_at = now
+                    logger.info("[LEARNING] " + " | ".join(t.summary() for t in self.trackers))
 
-                        if model.n_updates % MODEL_SAVE_EVERY == 0:
-                            self.save_model_state()
+                if (now - last_save_at).total_seconds() >= MODEL_SAVE_SECONDS:
+                    last_save_at = now
+                    state = self.model_state_snapshot()  # copied here, written in a thread
+                    await asyncio.to_thread(self.save_model_state, state)
 
-                        if model.n_updates % 50 == 0 and recent_hits:
-                            logger.info(
-                                "[LEARNING] samples=%s honest_accuracy=%.1f%% (last %s predictions)",
-                                model.n_updates,
-                                100 * sum(recent_hits) / len(recent_hits),
-                                len(recent_hits),
-                            )
+                if self.sample_buffer and (now - last_flush_at).total_seconds() >= SAMPLE_FLUSH_SECONDS:
+                    last_flush_at = now
+                    await self.flush_samples()
             except Exception:
                 logger.exception("Learning loop error")
             await asyncio.sleep(1)
@@ -794,14 +925,16 @@ class EOLivePredictorBot:
                         entry = float(trade["entry_price"])
                         score = float(trade.get("pytorch_output", 0))
                         was_win = (direction == "BUY" and current > entry) or (direction == "SELL" and current < entry)
+                        is_tie = round(current, 5) == round(entry, 5)
+                        result = "TIE" if is_tie else ("WIN" if was_win else "LOSS")
 
                         try:
                             self.db_client.table("paper_trades").update({
-                                "status": "WIN" if was_win else "LOSS",
+                                "status": result,
                                 "exit_price": round(current, 5)
                             }).eq("id", trade["id"]).execute()
 
-                            if trade.get("asset_pair") == "EUR/USD (Finnhub reference)":
+                            if not is_tie and trade.get("asset_pair") == "EUR/USD (Finnhub reference)":
                                 self.jarvis.learn_from_outcome(score, was_win)
                         except Exception as update_err:
                             logger.error(f"Failed inside resolution row: {update_err}")
