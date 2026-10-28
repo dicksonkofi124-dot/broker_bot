@@ -184,6 +184,7 @@ class JarvisLearningModule:
         self.total_wins = 0
         self.total_trades = 0
         self.model = OnlineLogisticModel(n_features=5)
+        self.last_edge = None
 
     @staticmethod
     def extract_features(prices):
@@ -218,6 +219,7 @@ class JarvisLearningModule:
             return 0, 0.0, TRADE_EXPIRATION_SECONDS, "Low"
 
         edge = self.model.predict_proba(features) - 0.5  # + means "price likely up"
+        self.last_edge = edge
         if abs(edge) < MIN_EDGE:
             return 0, edge, TRADE_EXPIRATION_SECONDS, "Low"
 
@@ -286,6 +288,9 @@ class JarvisLearningModule:
 class MarketDataFeed:
     """Live EUR/USD prices from Finnhub's WebSocket (needs a free API key)."""
 
+    STALE_WARN_SECONDS = 60
+    STALE_RECONNECT_SECONDS = 180
+
     def __init__(self):
         if not FINNHUB_API_KEY:
             raise RuntimeError("Missing required environment variable: FINNHUB_API_KEY")
@@ -340,17 +345,40 @@ class MarketDataFeed:
                         await ws.send(json.dumps({"type": "subscribe", "symbol": FINNHUB_SYMBOL}))
                         logger.info("Connected to Finnhub; subscribed to %s", FINNHUB_SYMBOL)
                         delay = 5
+                        connected_at = datetime.now(timezone.utc)
+                        last_warn_at = None
                         while True:
                             try:
-                                raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                                self._handle_message(raw)
                             except asyncio.TimeoutError:
+                                pass
+
+                            # Pings and other messages do not count: only real prices do.
+                            now = datetime.now(timezone.utc)
+                            last_price_at = connected_at
+                            if self.last_update_at and self.last_update_at > connected_at:
+                                last_price_at = self.last_update_at
+                            quiet_for = (now - last_price_at).total_seconds()
+
+                            if quiet_for >= self.STALE_RECONNECT_SECONDS:
                                 logger.warning(
-                                    "No %s prices for 60s (market closed, or forex streaming "
+                                    "No %s prices for %ds; reconnecting",
+                                    FINNHUB_SYMBOL,
+                                    quiet_for,
+                                )
+                                break
+                            if quiet_for >= self.STALE_WARN_SECONDS and (
+                                last_warn_at is None
+                                or (now - last_warn_at).total_seconds() >= 60
+                            ):
+                                last_warn_at = now
+                                logger.warning(
+                                    "No %s prices for %ds (market closed, or forex streaming "
                                     "is not included in your Finnhub plan)",
                                     FINNHUB_SYMBOL,
+                                    quiet_for,
                                 )
-                                continue
-                            self._handle_message(raw)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -500,24 +528,24 @@ class EOLivePredictorBot:
         offset = 0
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
 
-
+        
         while self.is_running:
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.get(url, params={"offset": offset, "timeout": 20}, timeout=25)
                     data = response.json()
-
+                    
                     if data.get("ok") and data.get("result"):
                         for update in data["result"]:
                             offset = update["update_id"] + 1
                             message = update.get("message")
-
+                            
                             if not message:
                                 continue
-
+                                
                             text = message.get("text", "")
                             chat_id = message["chat"]["id"]
-
+                            
                             command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
 
                             if text.startswith("/broadcast ") and str(chat_id) == TELEGRAM_CHAT_ID:
@@ -604,7 +632,7 @@ class EOLivePredictorBot:
                                     )
             except Exception as e:
                 logger.error(f"Telegram listener error: {e}")
-
+            
             await asyncio.sleep(2)
 
     async def log_trade(self, direction, price, score):
@@ -669,8 +697,30 @@ class EOLivePredictorBot:
         pending = deque()
         recent_hits = deque(maxlen=500)
         last_sample_at = None
+        last_status_at = None
         while self.is_running:
             try:
+                status_now = datetime.now(timezone.utc)
+                if last_status_at is None or (status_now - last_status_at).total_seconds() >= 120:
+                    last_status_at = status_now
+                    feed = self.feed
+                    price_age = (
+                        round((status_now - feed.last_update_at).total_seconds())
+                        if feed.last_update_at
+                        else None
+                    )
+                    edge = self.jarvis.last_edge
+                    logger.info(
+                        "[STATUS] price_age=%ss buffer=%s/%s samples=%s/%s last_edge=%s unlocked=%s",
+                        price_age,
+                        len(feed.price_buffer),
+                        SEQUENCE_LENGTH,
+                        self.jarvis.model.n_updates,
+                        MIN_TRAIN_SAMPLES,
+                        "none" if edge is None else f"{edge:+.3f}",
+                        getattr(self, "trading_unlocked", "n/a"),
+                    )
+
                 if self.feed.has_fresh_price() and self.feed.has_full_price_window():
                     now = datetime.now(timezone.utc)
                     price = self.feed.get_current_price()
