@@ -25,6 +25,14 @@ FINNHUB_WS_URL = "wss://ws.finnhub.io"
 # Safety gate: "relaxed" (default) pauses signals only after a clearly losing run,
 # "strict" pauses unless recent results are convincingly good, "off" never pauses.
 SIGNAL_GATE = os.getenv("SIGNAL_GATE", "relaxed").lower()
+# How "confident" is decided. "adaptive" (default): a signal needs the model's edge to be in its own
+# top SIGNAL_TOP_PERCENT of recent edges, so signals keep flowing however calm the model is.
+# "fixed": use the fixed MIN/MEDIUM/HIGH_EDGE numbers below (a calm model may then never signal).
+EDGE_MODE = os.getenv("EDGE_MODE", "adaptive").lower()
+try:
+    SIGNAL_TOP_PERCENT = max(0.5, min(50.0, float(os.getenv("SIGNAL_TOP_PERCENT", "3"))))
+except ValueError:
+    SIGNAL_TOP_PERCENT = 3.0
 
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
@@ -211,6 +219,7 @@ class JarvisLearningModule:
         self.total_trades = 0
         self.model = OnlineLogisticModel(n_features=5)
         self.last_edge = None
+        self.recent_abs_edges = deque(maxlen=1500)
         self.shadow_memory = deque(maxlen=60)  # would-be signals scored after the fact (sent or not)
         self.last_shadow_at = None
 
@@ -248,21 +257,40 @@ class JarvisLearningModule:
 
         edge = self.model.predict_proba(features) - 0.5  # + means "price likely up"
         self.last_edge = edge
-        if abs(edge) < MIN_EDGE:
+        self.recent_abs_edges.append(abs(edge))
+
+        min_edge, medium_edge, high_edge = self.thresholds()
+        if abs(edge) < min_edge:
             return 0, edge, TRADE_EXPIRATION_SECONDS, "Low"
 
         direction = 1 if edge > 0 else -1
-        confidence = self.confidence_band(edge)
+        if abs(edge) >= high_edge:
+            confidence = "High"
+        elif abs(edge) >= medium_edge:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
 
         if confidence != "Low" and not self.gate_allows():
             confidence = "Low"
 
         return direction, edge, TRADE_EXPIRATION_SECONDS, confidence
 
+    def thresholds(self):
+        """(minimum, medium, high) edge needed to signal right now."""
+        if EDGE_MODE != "adaptive" or len(self.recent_abs_edges) < 300:
+            return MIN_EDGE, MEDIUM_EDGE, HIGH_EDGE
+        ranked = sorted(self.recent_abs_edges)
+        last = len(ranked) - 1
+        medium = ranked[int(last * (1 - SIGNAL_TOP_PERCENT / 100))]
+        high = ranked[int(last * (1 - SIGNAL_TOP_PERCENT / 500))]
+        medium = max(medium, 0.002)  # never signal on a truly flat model
+        return medium, medium, max(high, medium)
+
     def record_shadow(self, edge, correct, when):
         """Score every confident prediction, sent or not, about once per 30s (nearly independent).
         This is what lets the gate reopen: blocked signals still get judged."""
-        if abs(edge) < MIN_EDGE:
+        if abs(edge) < self.thresholds()[0]:
             return
         if (
             self.last_shadow_at is not None
@@ -361,6 +389,7 @@ class HorizonTracker:
         self.small_moves = 0
         self.seen = 0
         self.on_result = None  # optional callback(edge, correct, time)
+        self.recent_abs = deque(maxlen=1000)
 
     def add_sample(self, now, features, price):
         edge = None
@@ -389,7 +418,11 @@ class HorizonTracker:
                 self.hits.append(correct)
                 if self.on_result:
                     self.on_result(edge, correct, now)
-                if abs(edge) >= MEDIUM_EDGE:
+                self.recent_abs.append(abs(edge))
+                strong_cut = MEDIUM_EDGE
+                if len(self.recent_abs) >= 100:
+                    strong_cut = sorted(self.recent_abs)[int(0.9 * (len(self.recent_abs) - 1))]
+                if abs(edge) >= strong_cut:
                     self.strong_hits.append(correct)
 
             if abs(price - entry) < self.min_move:
@@ -896,7 +929,7 @@ class EOLivePredictorBot:
                     )
                     edge = self.jarvis.last_edge
                     logger.info(
-                        "[STATUS] price_age=%ss buffer=%s/%s samples=%s/%s last_edge=%s unlocked=%s gate=%s",
+                        "[STATUS] price_age=%ss buffer=%s/%s samples=%s/%s last_edge=%s unlocked=%s gate=%s need_edge=%.3f",
                         price_age,
                         len(feed.price_buffer),
                         SEQUENCE_LENGTH,
@@ -905,6 +938,7 @@ class EOLivePredictorBot:
                         "none" if edge is None else f"{edge:+.3f}",
                         getattr(self, "trading_unlocked", "n/a"),
                         self.jarvis.gate_status(),
+                        self.jarvis.thresholds()[0],
                     )
 
                 if self.feed.has_fresh_price() and self.feed.has_full_price_window():
